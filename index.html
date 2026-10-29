@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Slow Time Pocket</title>
+<meta name="description" content="Hold to slow down time, drag to dodge falling blocks. A one-finger portrait survival game about speed and relief.">
+<style>
+html,body{margin:0;height:100%;background:#050914;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none;font-family:Arial,Helvetica,sans-serif}
+canvas{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);display:block;background:#050914}
+#mute{position:fixed;top:10px;right:10px;background:rgba(0,0,0,.45);color:#fff;border:0;border-radius:8px;padding:8px 12px;font-size:14px;z-index:2;cursor:pointer}
+.ov{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.6);padding:16px;z-index:3}
+.ov.show{display:flex}
+.box{background:#0d1a33;color:#fff;border:2px solid #6ec6ff;border-radius:14px;padding:18px 20px;max-width:440px;max-height:90vh;overflow:auto;line-height:1.45;font-size:16px}
+.box h2{color:#6ec6ff;margin:0 0 8px;font-size:26px}
+.box h3{margin:12px 0 4px;color:#6ec6ff;font-size:18px}
+.box ul{padding-left:20px;margin:6px 0}
+.box p{margin:8px 0}
+#closeHow{background:#6ec6ff;color:#0d1a33;border:0;border-radius:10px;padding:10px 22px;font-weight:bold;font-size:16px;cursor:pointer;margin-top:10px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<button id="mute">Sound: On</button>
+
+<div id="howto" class="ov">
+  <div class="box">
+    <h2>Slow Time Pocket</h2>
+    <p><b>Short description:</b> Everything is falling faster and faster. Hold the screen to slow down time, then drag to slip between the blocks. How long can you keep up?</p>
+    <h3>How to play</h3>
+    <ul>
+      <li>Drag your finger left or right to move the pocket watch.</li>
+      <li>Dodge the falling blocks, shards, and orbs. Touching one ends the run.</li>
+      <li>Hold anywhere on the screen to slow time. The slow-time meter drains while you hold.</li>
+      <li>Release to let the meter recharge. Time speeds back up when you let go.</li>
+      <li>Pass close to a block without touching it for a NEAR MISS bonus.</li>
+    </ul>
+    <h3>Controls</h3>
+    <ul>
+      <li>Touch: drag to move, hold to slow time.</li>
+      <li>Mouse: drag to move, hold the button to slow time.</li>
+      <li>Keyboard: Left and Right arrows to move, hold Space to slow time, Space to start or retry.</li>
+    </ul>
+    <button id="closeHow">GOT IT</button>
+  </div>
+</div>
+
+<script>
+// =====================================================================
+// Canvas and fit-to-screen (720x1280 portrait logical size)
+// =====================================================================
+const W = 720, H = 1280;
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = (W * s) + 'px';
+  cv.style.height = (H * s) + 'px';
+}
+addEventListener('resize', fit);
+fit();
+
+// =====================================================================
+// Sound (generated in code). Music starts on the first tap and runs
+// through the title, the run, and the game over screen.
+// =====================================================================
+let AC = null, master = null, muted = false, musicStep = 0, musicTimer = null;
+const muteBtn = document.getElementById('mute');
+const PATTERN = [262, 330, 392, 523, 392, 330, 294, 349, 392, 330, 262, 330];
+
+function initAudio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+  master = AC.createGain();
+  master.gain.value = muted ? 0 : 0.5;
+  master.connect(AC.destination);
+  musicLoop();
+}
+
+function tone(f, d, type = 'square', v = 0.15, slide = 0) {
+  if (!AC || muted) return;
+  const t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f, t);
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, f + slide), t + d);
+  g.gain.setValueAtTime(v, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + d);
+  o.connect(g); g.connect(master);
+  o.start(t); o.stop(t + d);
+}
+
+function noise(d, v, filterType = 'lowpass', freq = 800) {
+  if (!AC || muted) return;
+  const len = Math.floor(AC.sampleRate * d);
+  const buf = AC.createBuffer(1, len, AC.sampleRate), data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  const src = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+  src.buffer = buf;
+  f.type = filterType; f.frequency.value = freq;
+  g.gain.setValueAtTime(v, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + d);
+  src.connect(f); f.connect(g); g.connect(master);
+  src.start();
+}
+
+// Music tempo follows the run. It slows down while time is slowed.
+function musicLoop() {
+  if (!AC) return;
+  if (!muted) {
+    const n = PATTERN[musicStep % PATTERN.length];
+    tone(n, 0.22, 'triangle', state === 'over' ? 0.03 : 0.05);
+    if (musicStep % 4 === 0) tone(state === 'play' ? 65.4 : 82.4, 0.3, 'sine', 0.12);
+  }
+  musicStep++;
+  let base = 330;
+  if (state === 'play') base = Math.max(130, 330 - gameTime * 0.12);
+  if (slowing) base *= 1.9;
+  musicTimer = setTimeout(musicLoop, base);
+}
+
+const SFX = {
+  slowOn()  { noise(0.5, 0.18, 'lowpass', 420); tone(320, 0.5, 'sine', 0.1, -200); },
+  slowOff() { tone(480, 0.2, 'sine', 0.1, 280); },
+  swish()   { tone(900, 0.12, 'triangle', 0.08, -400); },
+  empty()   { tone(180, 0.12, 'square', 0.08); },
+  crash()   { noise(0.6, 0.4, 'lowpass', 500); tone(90, 0.6, 'sawtooth', 0.3, -60); },
+  milestone() { tone(660, 0.15, 'square', 0.1); setTimeout(() => tone(990, 0.25, 'square', 0.1), 110); }
+};
+
+muteBtn.onclick = (e) => {
+  e.stopPropagation();
+  muted = !muted;
+  if (master) master.gain.value = muted ? 0 : 0.5;
+  muteBtn.textContent = muted ? 'Sound: Off' : 'Sound: On';
+  muteBtn.blur();
+};
+
+// =====================================================================
+// Game state
+// =====================================================================
+let state = 'title';          // 'title' | 'play' | 'over'
+let objs = [], parts = [], texts = [];
+let player = { x: W / 2, y: H - 260, r: 34 };
+let targetX = W / 2;
+let gameTime = 0, nearMiss = 0, meter = 100, slowing = false, held = false;
+let spawnCD = 60, shake = 0, overAt = 0, t = 0, lastMile = 0;
+let best = 0;
+try { best = Number(localStorage.getItem('slow_time_pocket_best') || 0); } catch (e) {}
+
+const HOWTO = { x: 200, y: 1040, w: 320, h: 70 };
+const howtoEl = document.getElementById('howto');
+function showHowTo() { howtoEl.classList.add('show'); }
+document.getElementById('closeHow').onclick = () => howtoEl.classList.remove('show');
+
+function resetGame() {
+  objs = []; parts = []; texts = [];
+  player.x = W / 2; targetX = W / 2;
+  gameTime = 0; nearMiss = 0; meter = 100; slowing = false;
+  spawnCD = 60; shake = 0; lastMile = 0;
+}
+
+// Background stripes give a sense of speed
+const stripes = [];
+for (let i = 0; i < 22; i++) stripes.push({ x: Math.random() * W, y: Math.random() * H, len: 60 + Math.random() * 160, s: 0.6 + Math.random() * 0.8 });
+
+// =====================================================================
+// Spawning and score
+// =====================================================================
+const KINDS = [
+  { kind: 'block', w: 110, h: 46, c: '#7d8bb3', hi: '#b7c3e6' },
+  { kind: 'shard', w: 74,  h: 92, c: '#ff6b8a', hi: '#ffb3c2' },
+  { kind: 'orb',   w: 56,  h: 56, c: '#ffd23f', hi: '#fff4bd' }
+];
+
+function spawn() {
+  const k = KINDS[Math.floor(Math.random() * KINDS.length)];
+  const w = k.kind === 'block' ? 80 + Math.random() * 90 : k.w;
+  objs.push({
+    kind: k.kind, c: k.c, hi: k.hi,
+    w, h: k.h,
+    x: 20 + Math.random() * (W - 40 - w),
+    y: -k.h - 10,
+    speed: 6 + Math.min(9, gameTime / 900) + Math.random() * 1.2,
+    counted: false
+  });
+}
+
+function score() { return Math.floor(gameTime / 6) + nearMiss * 25; }
+
+function endGame() {
+  if (state === 'over') return;
+  state = 'over';
+  slowing = false;
+  overAt = t;
+  SFX.crash();
+  shake = 18;
+  burst(player.x, player.y, '#6ec6ff', 30);
+  const s = score();
+  if (s > best) {
+    best = s;
+    try { localStorage.setItem('slow_time_pocket_best', String(best)); } catch (e) {}
+  }
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 2 + Math.random() * 7;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 40, c: color, r: 3 + Math.random() * 5 });
+  }
+}
+function addText(x, y, s, c) { texts.push({ x, y, s, c, life: 55 }); }
+
+// =====================================================================
+// Update
+// =====================================================================
+function update() {
+  t++;
+  for (const s of stripes) {
+    const sp = (state === 'play' ? (slowing ? 2 : 8 + Math.min(10, gameTime / 200)) : 3) * s.s;
+    s.y += sp;
+    if (s.y > H + 200) { s.y = -200; s.x = Math.random() * W; }
+  }
+  if (state !== 'play') {
+    for (const p of parts) { p.x += p.vx; p.y += p.vy; p.life--; }
+    parts = parts.filter(p => p.life > 0);
+    if (shake > 0) { shake *= 0.85; if (shake < 0.5) shake = 0; }
+    return;
+  }
+
+  // Slow-time meter. It drains while held and recharges when released.
+  if (held && meter > 0) {
+    if (!slowing) { slowing = true; SFX.slowOn(); }
+    meter -= 0.42;
+    if (meter <= 0) { meter = 0; slowing = false; SFX.empty(); SFX.slowOff(); }
+  } else {
+    if (slowing) { slowing = false; SFX.slowOff(); }
+    meter = Math.min(100, meter + 0.25);
+  }
+
+  const f = slowing ? 0.35 : 1;
+  gameTime += f;
+
+  // Player moves toward the finger or arrow keys
+  player.x += (targetX - player.x) * 0.22;
+  player.x = Math.max(player.r + 10, Math.min(W - player.r - 10, player.x));
+
+  // Spawning gets faster over time
+  spawnCD -= f;
+  if (spawnCD <= 0) {
+    spawn();
+    spawnCD = Math.max(22, 55 - gameTime / 120) + Math.random() * 20;
+  }
+
+  for (const o of objs) {
+    o.y += o.speed * f;
+    // collision with a shrunk box around the watch
+    const px = player.x - player.r * 0.7, py = player.y - player.r * 0.7, pw = player.r * 1.4, ph = player.r * 1.4;
+    if (o.x < px + pw && o.x + o.w > px && o.y < py + ph && o.y + o.h > py) {
+      endGame();
+      return;
+    }
+    // near miss: the block has just passed the watch, close but not touched
+    if (!o.counted && o.y > player.y + player.r) {
+      o.counted = true;
+      const edge = Math.max(o.x - player.x, player.x - (o.x + o.w), 0);
+      if (edge > 0 && edge < 50) {
+        nearMiss++;
+        SFX.swish();
+        addText(player.x, player.y - 60, 'NEAR MISS!', '#6ec6ff');
+      }
+    }
+  }
+  objs = objs.filter(o => o.y < H + 120);
+
+  const s = score();
+  if (s >= lastMile + 100) {
+    lastMile = s - (s % 100);
+    SFX.milestone();
+    addText(W / 2, 360, s + ' pts', '#ffd23f');
+  }
+
+  for (const p of parts) { p.x += p.vx; p.y += p.vy; p.life--; }
+  parts = parts.filter(p => p.life > 0);
+  for (const x of texts) { x.y -= 1; x.life--; }
+  texts = texts.filter(x => x.life > 0);
+  if (shake > 0) { shake *= 0.85; if (shake < 0.5) shake = 0; }
+}
+
+// =====================================================================
+// Draw
+// =====================================================================
+function drawText(txt, x, y, size, color, alpha = 1) {
+  ctx.globalAlpha = alpha;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = color;
+  ctx.font = 'bold ' + size + 'px Arial';
+  ctx.fillText(txt, x, y);
+  ctx.globalAlpha = 1;
+}
+
+function drawBG() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, slowing ? '#0b2a52' : '#130b33');
+  g.addColorStop(1, slowing ? '#124a7a' : '#3a1450');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = slowing ? 'rgba(110,198,255,0.35)' : 'rgba(255,255,255,0.18)';
+  for (const s of stripes) {
+    ctx.fillRect(s.x, s.y, 3, s.len);
+  }
+  if (slowing) {
+    ctx.fillStyle = 'rgba(40,120,255,0.10)';
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function drawBlock(o) {
+  ctx.fillStyle = o.c;
+  if (o.kind === 'block') {
+    ctx.fillRect(o.x, o.y, o.w, o.h);
+    ctx.fillStyle = o.hi;
+    ctx.fillRect(o.x, o.y, o.w, 6);
+  } else if (o.kind === 'shard') {
+    ctx.beginPath();
+    ctx.moveTo(o.x, o.y);
+    ctx.lineTo(o.x + o.w, o.y);
+    ctx.lineTo(o.x + o.w / 2, o.y + o.h);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = o.hi;
+    ctx.beginPath();
+    ctx.moveTo(o.x + 8, o.y + 6);
+    ctx.lineTo(o.x + o.w - 8, o.y + 6);
+    ctx.lineTo(o.x + o.w / 2, o.y + o.h * 0.4);
+    ctx.closePath();
+    ctx.fill();
+  } else {
+    ctx.beginPath();
+    ctx.arc(o.x + o.w / 2, o.y + o.h / 2, o.w / 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = o.hi;
+    ctx.beginPath();
+    ctx.arc(o.x + o.w / 2 - 8, o.y + o.h / 2 - 8, o.w / 6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawWatch(x, y, r, frames) {
+  // blue halo while time is slowed
+  if (slowing) {
+    ctx.globalAlpha = 0.5 + 0.2 * Math.sin(t * 0.2);
+    ctx.fillStyle = '#6ec6ff';
+    ctx.beginPath(); ctx.arc(x, y, r * 1.8, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  // case
+  ctx.fillStyle = '#c9a23f';
+  ctx.beginPath(); ctx.arc(x, y, r + 6, 0, Math.PI * 2); ctx.fill();
+  // face
+  ctx.fillStyle = '#f5f0dc';
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  // hands: spin fast normally, slowly when time is slowed
+  const spin = slowing ? 0.03 : 0.16;
+  const a1 = frames * spin, a2 = frames * spin * 0.08;
+  ctx.strokeStyle = '#2b1450';
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a1) * r * 0.7, y + Math.sin(a1) * r * 0.7);
+  ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a2) * r * 0.45, y + Math.sin(a2) * r * 0.45);
+  ctx.stroke();
+  ctx.fillStyle = '#2b1450';
+  ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawMeter() {
+  const bw = 420, bh = 22, bx = (W - bw) / 2, by = 170;
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.fillRect(bx, by, bw, bh);
+  ctx.fillStyle = meter > 25 ? '#6ec6ff' : '#ff6b8a';
+  ctx.fillRect(bx, by, bw * (meter / 100), bh);
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(bx, by, bw, bh);
+  drawText('SLOW TIME', W / 2, by - 12, 22, 'rgba(255,255,255,0.85)');
+}
+
+function drawHUD() {
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 56px Arial';
+  ctx.fillText(score(), 30, 80);
+  ctx.font = '26px Arial';
+  ctx.fillStyle = 'rgba(255,255,255,0.8)';
+  ctx.fillText('BEST ' + best, 30, 120);
+  ctx.textAlign = 'right';
+  ctx.fillText('NEAR MISS ' + nearMiss, W - 30, 80);
+  drawMeter();
+}
+
+function drawTitle() {
+  drawText('SLOW TIME', W / 2, 360 + Math.sin(t * 0.05) * 5, 80, '#6ec6ff');
+  drawText('POCKET', W / 2, 450 + Math.sin(t * 0.05 + 1) * 5, 80, '#ffd23f');
+  drawText('Hold to slow the world.', W / 2, 530, 30, '#ffffff');
+  drawText('Drag to slip between the blocks.', W / 2, 572, 30, '#ffffff');
+  drawWatch(W / 2, 760, 70, t);
+  if (Math.floor(t / 30) % 2 === 0) drawText('TAP TO PLAY', W / 2, 960, 44, '#ffffff');
+  ctx.fillStyle = '#ffd23f';
+  ctx.fillRect(HOWTO.x, HOWTO.y, HOWTO.w, HOWTO.h);
+  drawText('HOW TO PLAY', W / 2, HOWTO.y + 46, 34, '#0d1a33');
+  drawText('Best: ' + best, W / 2, 1160, 28, 'rgba(255,255,255,0.8)');
+}
+
+function drawOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, W, H);
+  drawText('CRASHED', W / 2, 460, 74, '#ff6b8a');
+  drawText('Score ' + score(), W / 2, 560, 52, '#ffffff');
+  drawText('Near misses ' + nearMiss, W / 2, 615, 34, '#6ec6ff');
+  drawText('Best ' + best, W / 2, 665, 36, '#ffd23f');
+  if (t - overAt > 40 && Math.floor(t / 30) % 2 === 0) drawText('TAP TO RETRY', W / 2, 760, 44, '#ffffff');
+}
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+  drawBG();
+  if (state === 'title') { drawTitle(); return; }
+  for (const o of objs) drawBlock(o);
+  if (state === 'play' || state === 'over') drawWatch(player.x, player.y, player.r, t);
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life / 40);
+    ctx.fillStyle = p.c;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const x of texts) drawText(x.s, x.x, x.y, 36, x.c, Math.min(1, x.life / 25));
+  if (state === 'play') drawHUD();
+  if (state === 'over') drawOver();
+}
+
+function loop() {
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+
+// =====================================================================
+// Input: pointer events for touch, mouse, and pen
+// =====================================================================
+function toLogical(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+}
+
+function startRun() {
+  state = 'play';
+  resetGame();
+}
+
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  initAudio();
+  const p = toLogical(e);
+  if (state === 'title') {
+    const onHowTo = p.x >= HOWTO.x && p.x <= HOWTO.x + HOWTO.w && p.y >= HOWTO.y && p.y <= HOWTO.y + HOWTO.h;
+    if (onHowTo) { showHowTo(); return; }
+    startRun();
+    return;
+  }
+  if (state === 'over') {
+    if (t - overAt > 40) startRun();
+    return;
+  }
+  targetX = p.x;
+  held = true;
+});
+
+cv.addEventListener('pointermove', e => {
+  if (state !== 'play') return;
+  const p = toLogical(e);
+  targetX = p.x;
+});
+
+function release() { held = false; }
+addEventListener('pointerup', release);
+addEventListener('pointercancel', release);
+
+// Keyboard controls for desktop testing
+const keys = {};
+addEventListener('keydown', e => {
+  if (howtoEl.classList.contains('show')) return;
+  initAudio();
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (state === 'title') startRun();
+    else if (state === 'over' && t - overAt > 40) startRun();
+    else if (state === 'play') held = true;
+  }
+  if (e.code === 'ArrowLeft') { keys.left = true; }
+  if (e.code === 'ArrowRight') { keys.right = true; }
+});
+addEventListener('keyup', e => {
+  if (e.code === 'Space') held = false;
+  if (e.code === 'ArrowLeft') keys.left = false;
+  if (e.code === 'ArrowRight') keys.right = false;
+});
+setInterval(() => {
+  if (state !== 'play') return;
+  if (keys.left) targetX = Math.max(0, player.x - 14);
+  if (keys.right) targetX = Math.min(W, player.x + 14);
+}, 16);
+
+// Pause audio when the tab is hidden
+document.addEventListener('visibilitychange', () => {
+  if (!AC) return;
+  if (document.hidden && AC.state === 'running') AC.suspend();
+  if (!document.hidden && AC.state === 'suspended') AC.resume();
+});
+
+resetGame();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
